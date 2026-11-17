@@ -71,7 +71,6 @@ class MLPGFNModel(BasicGFNModel):
         return outputs[..., 0], outputs[..., 1:1 + num_actions], outputs[..., 1 + num_actions:]
 
 
-GFNModel = TabularGFNModel
 
 def valid_actions(state, side):
     return jnp.concatenate((state > 0, state < side - 1, jnp.ones(state.shape[:-1] + (1,), dtype=bool)), axis=-1)
