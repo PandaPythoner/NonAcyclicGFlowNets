@@ -14,9 +14,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 if __package__:
-    from .hypergrid import GFNModel, get_reward, train_step
+    from .hypergrid import MLPGFNModel, TabularGFNModel, get_reward, train_step
 else:
-    from hypergrid import GFNModel, get_reward, train_step
+    from hypergrid import MLPGFNModel, TabularGFNModel, get_reward, train_step
 
 
 @eqx.filter_jit
@@ -43,8 +43,15 @@ def positive_int(value):
     return number
 
 
+def optimizer_labels(params):
+    labels = jax.tree.map(lambda _: "model", params)
+    return eqx.tree_at(lambda model: model.log_z, labels, "log_z")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train a tabular GFlowNet on cyclic Hypergrid.")
+    parser = argparse.ArgumentParser(description="Train a GFlowNet on cyclic Hypergrid.")
+    parser.add_argument("--model", choices=("tabular", "mlp"), default="tabular")
+    parser.add_argument("--log-z-components", type=positive_int, default=64)
     parser.add_argument("--steps", type=positive_int, default=10_000)
     parser.add_argument("--batch-size", type=positive_int, default=64)
     parser.add_argument("--window", type=positive_int, default=200_000,
@@ -53,6 +60,8 @@ def main():
                         help="Number of rollout slots, including the first cell.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--log-z-lr", type=float,
+                        help="Adam learning rate per log Z component (defaults to --lr).")
     parser.add_argument("--flow-regularization-coeff", type=float, nargs="+", default=[0.001],
                         help="One or more flow penalty coefficients to compare (0 disables it).")
     parser.add_argument("--output", type=Path, default=Path("hypergrid_metrics.png"))
@@ -61,9 +70,15 @@ def main():
         parser.error("--max-length must be at least 2 so the policy can choose stop")
     if any(not np.isfinite(coeff) or coeff < 0 for coeff in args.flow_regularization_coeff):
         parser.error("--flow-regularization-coeff must contain finite nonnegative values")
+    log_z_lr = args.lr if args.log_z_lr is None else args.log_z_lr
+    if not np.isfinite(log_z_lr) or log_z_lr <= 0:
+        parser.error("--log-z-lr must be finite and positive")
 
     side, dim = 7, 2
-    optimizer = optax.adam(args.lr)
+    optimizer = optax.partition(
+        {"model": optax.adam(args.lr), "log_z": optax.adam(log_z_lr)},
+        optimizer_labels,
+    )
     grid_shape = (side,) * dim
     cells = jnp.indices(grid_shape).reshape(dim, -1).T
     rewards = np.asarray(get_reward(cells, side), dtype=np.float64)
@@ -73,9 +88,14 @@ def main():
 
     samples = np.arange(1, args.steps + 1) * args.batch_size
     fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True, layout="constrained")
-    fig.suptitle(f"Cyclic Hypergrid {side}×{side} (seed {args.seed})")
+    fig.suptitle(f"Cyclic Hypergrid {side}×{side} · {args.model} (seed {args.seed})\n"
+                 f"log Z: {args.log_z_components} components, LR {log_z_lr:g}")
     for coeff in args.flow_regularization_coeff:
-        model = GFNModel(side, dim)
+        if args.model == "tabular":
+            model = TabularGFNModel(side, dim, args.log_z_components)
+        else:
+            init_key = random.fold_in(random.key(args.seed), 0)
+            model = MLPGFNModel(side, dim, args.log_z_components, key=init_key)
         metrics = run_experiment(args, model, optimizer, target, coeff)
         for ax, values in zip(axes, metrics):
             ax.plot(samples, values, label=f"λ = {coeff:g}")
@@ -128,7 +148,7 @@ def run_experiment(args, model, optimizer, target, coeff):
         if step == 1 or step == args.steps or step % max(1, args.steps // 10) == 0:
             truncated = 1 - completed / len(recent)
             print(
-                f"λ={coeff:g}  {step}/{args.steps}  DB={loss:.5g}  L1={distance:.4f}  "
+                f"{args.model}  λ={coeff:g}  {step}/{args.steps}  DB={loss:.5g}  L1={distance:.4f}  "
                 f"mean length={mean_length:.2f}  log Z={log_z:.5f}  "
                 f"truncated in window={truncated:.1%}",
                 flush=True,

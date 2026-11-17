@@ -1,31 +1,50 @@
+from abc import abstractmethod
+
 import jax
 import jax.numpy as jnp
 from jax import random
 import equinox as eqx
-import optax
 
 
-class GFNModel(eqx.Module):
-    flow: jax.Array # (x, y) -> log flow
-    forward_policy: jax.Array # (x, y, move) -> logit
-    backward_policy: jax.Array # (x, y, last_move) -> logit
-                                # here last_move is incoming move
-                                # 2 * dim moves are basic moves
-                                # and the last move means move from starting position
+class BasicGFNModel(eqx.Module):
     log_z: jax.Array
     side: int = eqx.field(static=True)
     dim: int = eqx.field(static=True)
 
-    def __init__(self, side, dim):
+    def __init__(self, side, dim, log_z_components=64):
+        if log_z_components < 1:
+            raise ValueError("log_z_components must be positive")
         self.side = side
         self.dim = dim
-        self.log_z = jnp.array(0.0)
-        self.flow = jnp.zeros((self.side,) * self.dim)
-        self.forward_policy = jnp.zeros((self.side,) * self.dim + (2 * self.dim + 1, ))
-        self.backward_policy = jnp.zeros((self.side,) * self.dim + (2 * self.dim + 1, ))
+        self.log_z = jnp.zeros((log_z_components,))
+
+    def get_log_z(self):
+        return self.log_z.sum()
 
     def __call__(self, states):
-        states = jnp.maximum(states, 0) # terminal state is (-1, -1, ...)
+        # Terminal slots use a valid cell for lookup and are masked in the loss.
+        return self.predict(jnp.maximum(states, 0))
+
+    @abstractmethod
+    def predict(self, states):
+        """Return log flow, forward logits, and backward logits for grid states."""
+
+
+class TabularGFNModel(BasicGFNModel):
+    flow: jax.Array
+    forward_policy: jax.Array
+    backward_policy: jax.Array
+
+    def __init__(self, side, dim, log_z_components=64):
+        super().__init__(side, dim, log_z_components)
+        grid_shape = (side,) * dim
+        policy_shape = grid_shape + (2 * dim + 1,)
+        self.flow = jnp.zeros(grid_shape)
+        self.forward_policy = jnp.zeros(policy_shape)
+        # Backward logits index the incoming move. The last slot is the source.
+        self.backward_policy = jnp.zeros(policy_shape)
+
+    def predict(self, states):
         coordinates = jnp.moveaxis(states, -1, 0)
         idx = tuple(coordinates)
         flow = self.flow[idx]
@@ -33,9 +52,26 @@ class GFNModel(eqx.Module):
         backward_logits = self.backward_policy[idx]
         return flow, forward_logits, backward_logits
 
-    def get_log_z(self):
-        return self.log_z
-        
+
+class MLPGFNModel(BasicGFNModel):
+    network: eqx.nn.MLP
+
+    def __init__(self, side, dim, log_z_components=64, *, key):
+        super().__init__(side, dim, log_z_components)
+        self.network = eqx.nn.MLP(
+            in_size=side * dim, out_size=4 * dim + 3,
+            width_size=256, depth=2, key=key,
+        )
+
+    def predict(self, states):
+        inputs = jax.nn.one_hot(states, self.side).reshape(-1, self.dim * self.side)
+        outputs = jax.vmap(self.network)(inputs)
+        outputs = outputs.reshape(states.shape[:-1] + (4 * self.dim + 3,))
+        num_actions = 2 * self.dim + 1
+        return outputs[..., 0], outputs[..., 1:1 + num_actions], outputs[..., 1 + num_actions:]
+
+
+GFNModel = TabularGFNModel
 
 def valid_actions(state, side):
     return jnp.concatenate((state > 0, state < side - 1, jnp.ones(state.shape[:-1] + (1,), dtype=bool)), axis=-1)
@@ -43,7 +79,7 @@ def valid_actions(state, side):
 def valid_inverse_actions(state, side):
     return jnp.concatenate((state < side - 1, state > 0, jnp.ones(state.shape[:-1] + (1,), dtype=bool)), axis=-1)
 
-def run_trajectory(model: GFNModel, key, max_length=128):
+def run_trajectory(model: BasicGFNModel, key, max_length=128):
     dim, side = model.dim, model.side
     stop_action = 2 * dim
 
@@ -95,7 +131,7 @@ def get_reward(state, side):
     peak = jnp.all((distance > 0.3) & (distance < 0.4), axis=-1)
     return 1e-3 + 0.5 * outer + 2.0 * peak
 
-def calc_loss(model: GFNModel, trajectory, actions):
+def calc_loss(model: BasicGFNModel, trajectory, actions):
     dim, side = model.dim, model.side
 
     length = trajectory.shape[0]
