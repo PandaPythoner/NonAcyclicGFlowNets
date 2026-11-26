@@ -11,15 +11,13 @@ class BasicGFNModel(eqx.Module):
     side: int = eqx.field(static=True)
     dim: int = eqx.field(static=True)
 
-    def __init__(self, side, dim, log_z_components=64):
-        if log_z_components < 1:
-            raise ValueError("log_z_components must be positive")
+    def __init__(self, side, dim):
         self.side = side
         self.dim = dim
-        self.log_z = jnp.zeros((log_z_components,))
+        self.log_z = jnp.zeros(())
 
     def get_log_z(self):
-        return self.log_z.sum()
+        return self.log_z
 
     def __call__(self, states):
         # Terminal slots use a valid cell for lookup and are masked in the loss.
@@ -35,8 +33,8 @@ class TabularGFNModel(BasicGFNModel):
     forward_policy: jax.Array
     backward_policy: jax.Array
 
-    def __init__(self, side, dim, log_z_components=64):
-        super().__init__(side, dim, log_z_components)
+    def __init__(self, side, dim):
+        super().__init__(side, dim)
         grid_shape = (side,) * dim
         policy_shape = grid_shape + (2 * dim + 1,)
         self.flow = jnp.zeros(grid_shape)
@@ -56,8 +54,8 @@ class TabularGFNModel(BasicGFNModel):
 class MLPGFNModel(BasicGFNModel):
     network: eqx.nn.MLP
 
-    def __init__(self, side, dim, log_z_components=64, *, key):
-        super().__init__(side, dim, log_z_components)
+    def __init__(self, side, dim, *, key):
+        super().__init__(side, dim)
         self.network = eqx.nn.MLP(
             in_size=side * dim, out_size=4 * dim + 3,
             width_size=256, depth=2, key=key,
@@ -190,7 +188,7 @@ def calc_loss(model: BasicGFNModel, trajectory, actions):
 def train_step(
     model, optimizer, opt_state, key, batch_size=64, *,
     max_length=128, return_trajectories=False, flow_regularization_coeff=0.001,
-    return_db_loss=False,
+    return_db_loss=False, project_flow_gradient=False,
 ):
     key, rollout_key = random.split(key)
     keys = random.split(rollout_key, batch_size)
@@ -203,12 +201,63 @@ def train_step(
         loss_sums, edge_counts, flow_sums, states_counts = jax.vmap(
             calc_loss, in_axes=(None, 0, 0)
         )(model, trajectories, actions)
-        basic_loss = loss_sums.sum() / edge_counts.sum()
-        flow_regularization = flow_sums.sum() / states_counts.sum()
-        return basic_loss + flow_regularization * flow_regularization_coeff, basic_loss
+        db_loss = loss_sums.sum() / edge_counts.sum()
+        flow_loss = flow_sums.sum() / states_counts.sum()
+        return db_loss, flow_loss
 
-    (loss, db_loss), grads = eqx.filter_value_and_grad(batch_loss, has_aux=True)(model)
+    def gradient_dot(first, second):
+        return sum(
+            jnp.vdot(a, b)
+            for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second))
+        )
+
+    def gradient_proj(grad, restriction, restrict_negative=True):
+        # for restrict_negative=True:
+        # if <grad, restriction> < 0 projects grad to be perpendicular to restriction
+        # else returns grad
+        # for restrict_negative=False projects if inner product is positive
+
+        restriction_norm_squared = gradient_dot(restriction, restriction)
+        denominator = jnp.where(restriction_norm_squared > 0, restriction_norm_squared, 1.0)
+
+        inner_product = gradient_dot(grad, restriction)
+        projection_coeff = jnp.where(restrict_negative, jnp.minimum(inner_product, 0.0), jnp.maximum(inner_product, 0.0)) / denominator
+        projected = jax.tree.map(
+            lambda grad_vec, restriction_vec: grad_vec - projection_coeff * restriction_vec,
+            grad,
+            restriction,
+        )
+        return projected
+
+
+    if project_flow_gradient:
+        def loss_vector(model):
+            values = jnp.stack(batch_loss(model))
+            return values, values
+
+        jacobian, loss_values = eqx.filter_jacrev(loss_vector, has_aux=True)(model)
+        db_loss, flow_loss = loss_values
+        loss = db_loss + flow_regularization_coeff * flow_loss
+        db_grads = jax.tree.map(lambda grad: grad[0], jacobian)
+        flow_grads = jax.tree.map(lambda grad: grad[1], jacobian)
+
+        projected_flow_grads = gradient_proj(flow_grads, db_grads)
+        grads = jax.tree.map(
+            lambda db_grad, flow_grad: db_grad + flow_regularization_coeff * flow_grad,
+            db_grads,
+            projected_flow_grads,
+        )
+    else:
+        def total_loss(model):
+            db_loss, flow_loss = batch_loss(model)
+            return db_loss + flow_regularization_coeff * flow_loss, db_loss
+
+        (loss, db_loss), grads = eqx.filter_value_and_grad(total_loss, has_aux=True)(model)
+
     updates, opt_state = optimizer.update(grads, opt_state)
+
+    if project_flow_gradient:
+        updates = gradient_proj(updates, db_grads, restrict_negative=False)
     model = eqx.apply_updates(model, updates)
     reported_loss = db_loss if return_db_loss else loss
     if return_trajectories:
